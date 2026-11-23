@@ -1,0 +1,868 @@
+#!/usr/bin/env bash
+#
+#  broom - keep a Linux box lean: see what eats your disk, clean it safely,
+#          update everything with one command, spot duplicate files.
+#
+#  https://github.com/matteospanio/broom  ·  MIT License
+#
+set -euo pipefail
+
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+  echo "broom: bash >= 4.4 is required (found $BASH_VERSION)" >&2
+  exit 1
+fi
+
+readonly VERSION="0.1.0"
+readonly PROG=${0##*/}
+
+# --------------------------------------------------------------------------
+# Settings (everything is derived from the environment, nothing hardcoded)
+# --------------------------------------------------------------------------
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}
+DATA=${XDG_DATA_HOME:-$HOME/.local/share}
+CONDA=${CONDA_EXE:-conda}   # conda is often only a shell function; conda init exports CONDA_EXE
+
+CMD="" HELP=0 SHOW_VERSION=0 DRY_RUN=0 ASSUME_YES=0 ALL=0 QUIET=0 NO_COLOR_FLAG=0
+DAYS=30 JOURNAL_SIZE=500M MIN_SIZE=50M
+EXCLUDE=() PATHS=() ARGS=() SELECTED=() BUILDS=()
+YES=() NOCONFIRM=()          # extra flags for package managers when --yes is given
+FAILED=0                     # set by run() when a command of the current task fails
+SKIP_REASON=""               # set by a task's "check" when it does not apply
+ROW_TASK=() ROW_STATE=() ROW_NOTE=()
+
+BOLD='' DIM='' RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' RESET=''
+
+# --------------------------------------------------------------------------
+# Task registry
+#   Every task is a function <kind>_<name> that takes one action:
+#     check     return 0 if the task applies here (may set SKIP_REASON)
+#     estimate  print reclaimable bytes; print nothing if unknown (clean only)
+#     details   print extra info, e.g. the list of paths to delete (optional)
+#     run       do the work, always through run/as_root/safe_rm (dry-run aware)
+# --------------------------------------------------------------------------
+CLEAN_TASKS=(snap journal packages flatpak trash thumbnails devcaches jetbrains builds docker)
+UPDATE_TASKS=(system snap flatpak pipx uv rustup omz tldr firmware)
+
+declare -A DESC=(
+  [clean.snap]="Remove disabled (superseded) snap revisions"
+  [clean.journal]="Shrink the systemd journal to --journal-size"
+  [clean.packages]="Remove orphaned packages and the package cache (apt/dnf/pacman)"
+  [clean.flatpak]="Uninstall unused flatpak runtimes"
+  [clean.trash]="Empty the desktop trash"
+  [clean.thumbnails]="Delete thumbnails older than --older-than days"
+  [clean.devcaches]="Empty pip/poetry/npm/yarn/go/cargo/pre-commit caches, prune uv/pnpm/conda"
+  [clean.jetbrains]="Delete caches and plugins of superseded JetBrains IDE versions"
+  [clean.builds]="Delete stale target/, node_modules/, virtualenvs and .mypy_cache under --path"
+  [clean.docker]="Prune unused Docker images, containers, networks and build cache"
+  [update.system]="Upgrade system packages (apt/dnf/pacman)"
+  [update.snap]="Refresh snaps"
+  [update.flatpak]="Update flatpaks"
+  [update.pipx]="Upgrade apps installed with pipx"
+  [update.uv]="Upgrade tools installed with uv"
+  [update.rustup]="Update Rust toolchains"
+  [update.omz]="Update oh-my-zsh"
+  [update.tldr]="Refresh the tldr pages cache"
+  [update.firmware]="Install firmware updates via fwupd (may need a reboot)"
+)
+declare -A ROOT=([clean.snap]=1 [clean.journal]=1 [clean.packages]=1 [update.system]=1 [update.snap]=1)
+declare -A OPTIN=([clean.builds]=1 [clean.docker]=1 [update.firmware]=1)
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+setup_colors() {
+  if ((NO_COLOR_FLAG)) || [[ -n ${NO_COLOR:-} || ! -t 1 ]]; then return 0; fi
+  BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m'
+  BLUE=$'\e[34m' MAGENTA=$'\e[35m' CYAN=$'\e[36m' RESET=$'\e[0m'
+}
+
+info() { printf '  %s➜%s %s\n' "$CYAN" "$RESET" "$*"; }
+ok()   { printf '  %s✔%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '  %s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+err()  { printf '%s✖%s %s\n' "$RED" "$RESET" "$*" >&2; }
+die()  { err "$1"; exit "${2:-1}"; }
+
+banner() {
+  ((QUIET)) && return 0
+  local -a text=(
+    '    __'
+    '   / /_  _________  ____  ____ ___'
+    '  / __ \/ ___/ __ \/ __ \/ __ `__ \'
+    ' / /_/ / /  / /_/ / /_/ / / / / / /'
+    '/_.___/_/   \____/\____/_/ /_/ /_/'
+    ''
+  )
+  local -a brush=('     |' '     |' '     |' '    /|\' '   //|\\' '  ///|\\\')
+  local i
+  echo
+  for i in "${!text[@]}"; do
+    printf '%s%-36s%s%s%s\n' "$MAGENTA$BOLD" "${text[i]}" "$YELLOW" "${brush[i]}" "$RESET"
+  done
+  printf '%s  keep your Linux box lean · v%s%s\n' "$DIM" "$VERSION" "$RESET"
+}
+
+section() { printf '\n%s%s%s\n' "$BOLD$BLUE" "$1" "$RESET"; }
+
+task_header() { # kind task
+  local tag=''
+  if [[ -n ${ROOT[$1.$2]:-} ]]; then tag=" ${YELLOW}[sudo]${RESET}"; fi
+  printf '\n%s▸ %s%s  %s%s%s%s\n' "$BOLD" "$2" "$RESET" "$DIM" "${DESC[$1.$2]}" "$RESET" "$tag"
+}
+
+# Run a command with a spinner on stderr (only when stderr is a terminal).
+spin() {
+  local msg=$1; shift
+  if ((QUIET)) || [[ ! -t 2 ]]; then "$@"; return; fi
+  local -a frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  local i=0 rc=0 pid
+  "$@" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s%s%s %s' "$CYAN" "${frames[i++ % 10]}" "$RESET" "$msg" >&2
+    sleep 0.1
+  done
+  wait "$pid" || rc=$?
+  printf '\r\e[K' >&2
+  return "$rc"
+}
+
+add_row() { ROW_TASK+=("$1"); ROW_STATE+=("$2"); ROW_NOTE+=("${3:-}"); }
+
+print_summary() {
+  section "Summary"
+  local i state
+  for i in "${!ROW_TASK[@]}"; do
+    case ${ROW_STATE[i]} in
+      done)    state="${GREEN}✔ done   ${RESET}" ;;
+      failed)  state="${RED}✖ failed ${RESET}" ;;
+      dry)     state="${CYAN}○ dry run${RESET}" ;;
+      *)       state="${DIM}– skipped${RESET}" ;;
+    esac
+    printf '  %-12s %s  %s%s%s\n' "${ROW_TASK[i]}" "$state" "$DIM" "${ROW_NOTE[i]}" "$RESET"
+  done
+}
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+has()     { command -v "$1" >/dev/null 2>&1; }
+in_list() { local needle=$1 x; shift; for x; do [[ $x == "$needle" ]] && return 0; done; return 1; }
+tildify() { if [[ $1 == "$HOME"/* ]]; then printf '~/%s' "${1#"$HOME"/}"; else printf '%s' "$1"; fi; }
+repeat()  { local out='' i; for ((i = 0; i < $2; i++)); do out+=$1; done; printf '%s' "$out"; }
+
+# 1610612736 -> "1.5 GiB"
+human() {
+  LC_ALL=C awk -v b="${1:-0}" 'BEGIN {
+    split("B KiB MiB GiB TiB PiB", u, " "); i = 1
+    while (b >= 1024 && i < 6) { b /= 1024; i++ }
+    printf(i == 1 ? "%d %s" : "%.1f %s", b, u[i]) }'
+}
+
+# "500M" -> 524288000 (K, M, G, T are powers of 1024)
+to_bytes() { LC_ALL=C numfmt --from=iec "${1%B}" 2>/dev/null; }
+
+# Disk usage in bytes of the given paths together (missing paths are ignored).
+bytes_of() {
+  local p out
+  local -a found=()
+  for p in "$@"; do if [[ -e $p ]]; then found+=("$p"); fi; done
+  if ((${#found[@]} == 0)); then echo 0; return 0; fi
+  out=$(du -scB1 -- "${found[@]}" 2>/dev/null | tail -n1) || true
+  out=${out%%[[:space:]]*}
+  echo "${out:-0}"
+}
+
+# Print "size  path" for each non-empty path.
+list_sizes() {
+  local p b
+  for p in "$@"; do
+    b=$(bytes_of "$p")
+    ((b > 0)) || continue
+    printf '    %s%10s%s  %s\n' "$DIM" "$(human "$b")" "$RESET" "$(tildify "$p")"
+  done
+}
+
+# Free bytes summed over the filesystems holding / and $HOME.
+free_bytes() {
+  LC_ALL=C df -B1 --output=avail,target / "$HOME" 2>/dev/null |
+    awk 'NR > 1 && !seen[$2]++ { s += $1 } END { print s + 0 }'
+}
+
+disk_bar() { # mount point
+  local size used avail pcent target pct fill width=30 color=$GREEN
+  read -r size used avail pcent target < <(LC_ALL=C df -B1 --output=size,used,avail,pcent,target -- "$1" | awk 'NR == 2')
+  pct=${pcent%\%}
+  fill=$((pct * width / 100))
+  if ((pct >= 90)); then color=$RED; elif ((pct >= 75)); then color=$YELLOW; fi
+  printf '  %-14s %s%s%s%s%s %3d%%  %s%s free%s of %s\n' "$target" \
+    "$color" "$(repeat '█' "$fill")" "$DIM" "$(repeat '░' $((width - fill)))" "$RESET" \
+    "$pct" "$BOLD" "$(human "$avail")" "$RESET" "$(human "$size")"
+}
+
+# --------------------------------------------------------------------------
+# Doing things (all side effects go through these three functions)
+# --------------------------------------------------------------------------
+run() {
+  local shown
+  shown=$(printf '%q ' "$@")
+  if ((DRY_RUN)); then
+    printf '    %swould run:%s %s\n' "$CYAN" "$RESET" "${shown% }"
+    return 0
+  fi
+  printf '    %s$ %s%s\n' "$DIM" "${shown% }" "$RESET"
+  "$@" || { FAILED=1; return 1; }
+}
+
+as_root() {
+  if ((EUID == 0)); then
+    run "$@"
+  elif has sudo; then
+    run sudo "$@"
+  else
+    warn "sudo is not available, cannot run: $*"
+    FAILED=1
+    return 1
+  fi
+}
+
+# safe_rm [--contents] PATH...  delete paths (or only what is inside them),
+# refusing anything that is relative, /, $HOME or contains "..".
+safe_rm() {
+  local contents=0 p
+  if [[ ${1:-} == --contents ]]; then contents=1; shift; fi
+  for p in "$@"; do
+    [[ -e $p || -L $p ]] || continue
+    case $p in
+      / | "$HOME" | "$HOME"/ | */.. | */../*) warn "refusing to delete '$p'"; FAILED=1; continue ;;
+      /*) ;;
+      *) warn "refusing to delete relative path '$p'"; FAILED=1; continue ;;
+    esac
+    if ((contents)); then run find "$p" -mindepth 1 -delete; else run rm -rf -- "$p"; fi
+  done
+}
+
+confirm() {
+  ((ASSUME_YES || DRY_RUN)) && return 0
+  if [[ ! -t 0 ]]; then warn "no terminal to ask for confirmation, skipping (use --yes)"; return 1; fi
+  local reply
+  read -r -p "  ${YELLOW}?${RESET} $1 [y/N] " reply || return 1
+  [[ $reply == [yY]* ]]
+}
+
+# Ask for the sudo password once, up front, if any selected task needs root.
+prepare_root() { # kind
+  local t need=0
+  if ((DRY_RUN || EUID == 0)); then return 0; fi
+  for t in "${SELECTED[@]}"; do
+    if [[ -n ${ROOT[$1.$t]:-} ]] && "${1}_$t" check 2>/dev/null; then need=1; fi
+  done
+  ((need)) || return 0
+  if ! has sudo; then warn "sudo not found: tasks that need root will fail"; return 0; fi
+  info "some tasks need root, asking for your password once"
+  sudo -v || warn "sudo authentication failed: tasks that need root will fail"
+}
+
+# --------------------------------------------------------------------------
+# Clean tasks
+# --------------------------------------------------------------------------
+disabled_snaps() {
+  LC_ALL=C snap list --all 2>/dev/null | awk '$NF ~ /(^|,)disabled(,|$)/ { print $1, $3 }'
+}
+
+clean_snap() {
+  local name rev total=0
+  local -a revs
+  case $1 in
+    check) has snap ;;
+    estimate)
+      mapfile -t revs < <(disabled_snaps)
+      for rev in "${revs[@]}"; do
+        name=${rev% *} rev=${rev#* }
+        total=$((total + $(stat -c %s "/var/lib/snapd/snaps/${name}_${rev}.snap" 2>/dev/null || echo 0)))
+        total=$((total + $(bytes_of "$HOME/snap/$name/$rev")))
+      done
+      echo "$total" ;;
+    run)
+      mapfile -t revs < <(disabled_snaps)
+      for rev in "${revs[@]}"; do
+        as_root snap remove "${rev% *}" --revision="${rev#* }"
+      done ;;
+  esac
+}
+
+journal_bytes() {
+  local s
+  s=$(LC_ALL=C journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGTP]?' | head -n1) || true
+  to_bytes "${s:-0}" || echo 0
+}
+
+clean_journal() {
+  local used limit
+  case $1 in
+    check) has journalctl ;;
+    estimate)
+      used=$(journal_bytes)
+      limit=$(to_bytes "$JOURNAL_SIZE")
+      echo $((used > limit ? used - limit : 0)) ;;
+    run) as_root journalctl --vacuum-size="$JOURNAL_SIZE" ;;
+  esac
+}
+
+pkg_manager() {
+  local m
+  for m in apt-get dnf pacman; do
+    if has "$m"; then echo "$m"; return 0; fi
+  done
+  return 1
+}
+
+clean_packages() {
+  local pm b=0
+  pm=$(pkg_manager) || { SKIP_REASON="no apt, dnf or pacman"; return 1; }
+  case $1 in
+    estimate)
+      case $pm in
+        apt-get) b=$(bytes_of /var/cache/apt/archives) ;;
+        dnf) b=$(bytes_of /var/cache/dnf /var/cache/libdnf5) ;;
+        pacman) b=$(bytes_of /var/cache/pacman/pkg) ;;
+      esac
+      # orphaned packages can't be sized cheaply: an empty cache means "unknown", not 0
+      if ((b > 0)); then echo "$b"; fi ;;
+    run)
+      case $pm in
+        apt-get) as_root apt-get autoremove --purge "${YES[@]}"; as_root apt-get clean ;;
+        dnf) as_root dnf autoremove "${YES[@]}"; as_root dnf clean all ;;
+        pacman)
+          if has paccache; then
+            as_root paccache -rk2
+            as_root paccache -ruk0
+          else
+            as_root pacman -Sc "${NOCONFIRM[@]}"
+          fi ;;
+      esac ;;
+  esac
+}
+
+clean_flatpak() {
+  case $1 in
+    check) has flatpak ;;
+    run) run flatpak uninstall --unused "${YES[@]}" ;;
+  esac
+}
+
+clean_trash() {
+  local t=$DATA/Trash
+  case $1 in
+    check) [[ -d $t ]] || { SKIP_REASON="no trash folder"; return 1; } ;;
+    estimate) bytes_of "$t/files" "$t/info" "$t/expunged" ;;
+    run) safe_rm --contents "$t/files" "$t/info" "$t/expunged" ;;
+  esac
+}
+
+clean_thumbnails() {
+  local t=$CACHE/thumbnails
+  case $1 in
+    check) [[ -d $t ]] || { SKIP_REASON="no thumbnail cache"; return 1; } ;;
+    estimate)
+      { find "$t" -type f -mtime +"$DAYS" -printf '%s\n' 2>/dev/null || true; } |
+        awk '{ s += $1 } END { print s + 0 }' ;;
+    run) run find "$t" -type f -mtime +"$DAYS" -delete ;;
+  esac
+}
+
+devcache_dirs() {
+  printf '%s\n' \
+    "$CACHE/pip" "$CACHE/pypoetry/cache" "$CACHE/pypoetry/artifacts" "$CACHE/pre-commit" \
+    "${npm_config_cache:-$HOME/.npm}/_cacache" "$CACHE/yarn" "$CACHE/puppeteer" "$CACHE/electron" \
+    "${GOCACHE:-$CACHE/go-build}" "${CARGO_HOME:-$HOME/.cargo}/registry/cache"
+}
+
+clean_devcaches() {
+  local d b
+  local -a dirs
+  mapfile -t dirs < <(devcache_dirs)
+  case $1 in
+    check)
+      for d in "${dirs[@]}"; do [[ -d $d ]] && return 0; done
+      for d in uv pnpm "$CONDA"; do has "$d" && return 0; done
+      SKIP_REASON="no known caches found"
+      return 1 ;;
+    estimate)
+      b=$(bytes_of "${dirs[@]}")
+      # uv/pnpm/conda prune only what is unused, which can't be sized in advance
+      if ((b > 0)) || ! { has uv || has pnpm || has "$CONDA"; }; then echo "$b"; fi ;;
+    details) list_sizes "${dirs[@]}" ;;
+    run)
+      for d in "${dirs[@]}"; do
+        if [[ -d $d ]]; then safe_rm --contents "$d"; fi
+      done
+      if has uv; then run uv cache prune; fi
+      if has pnpm; then run pnpm store prune; fi
+      if has "$CONDA"; then run "$CONDA" clean --all "${YES[@]}"; fi ;;
+  esac
+}
+
+# Print every JetBrains version dir that has a newer sibling, e.g.
+# PyCharm2025.2 when PyCharm2025.3 exists. Settings in ~/.config are untouched.
+jetbrains_stale() {
+  local base dir name
+  for base in "$CACHE/JetBrains" "$DATA/JetBrains"; do
+    [[ -d $base ]] || continue
+    for dir in "$base"/*/; do
+      name=$(basename "$dir")
+      [[ $name =~ ^([A-Za-z]+)([0-9]{4}\.[0-9]+)$ ]] || continue
+      printf '%s\t%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${dir%/}"
+    done | sort -t $'\t' -k1,1 -k2,2V | awk -F '\t' '$1 == prev { print last } { prev = $1; last = $3 }'
+  done
+}
+
+clean_jetbrains() {
+  local -a stale
+  mapfile -t stale < <(jetbrains_stale)
+  case $1 in
+    check) [[ -d $CACHE/JetBrains || -d $DATA/JetBrains ]] || { SKIP_REASON="no JetBrains IDE data"; return 1; } ;;
+    estimate) bytes_of "${stale[@]}" ;;
+    details) list_sizes "${stale[@]}" ;;
+    run) safe_rm "${stale[@]}" ;;
+  esac
+}
+
+# A directory only counts as a build artifact if its project marker is there.
+is_artifact() {
+  local parent=${1%/*}
+  case ${1##*/} in
+    target) [[ -f $parent/Cargo.toml || -f $parent/pom.xml ]] ;;
+    node_modules) [[ -f $parent/package.json ]] ;;
+    .venv | venv | env) [[ -f $1/pyvenv.cfg ]] ;;
+    *) return 0 ;; # .mypy_cache is always regenerable
+  esac
+}
+
+# Stale = nothing in its project (the parent dir, 4 levels deep, ignoring .git
+# and dependency/build dirs) changed in the last DAYS days. Using a venv or
+# node_modules doesn't touch it, so its own timestamps say nothing.
+is_stale() {
+  [[ -z $(find "${1%/*}" -maxdepth 4 \
+    \( -name .git -o -name node_modules -o -name target -o -name .venv -o -name venv -o -name env -o -name .mypy_cache \) -prune \
+    -o -newermt "$DAYS days ago" -print -quit 2>/dev/null) ]]
+}
+
+find_builds() {
+  { find "${PATHS[@]}" -xdev -mindepth 1 \
+      \( -type d -name '.*' ! -name .venv ! -name .mypy_cache -prune \) -o \
+      \( -type d \( -name target -o -name node_modules -o -name .venv -o -name venv -o -name env \
+        -o -name .mypy_cache \) -print -prune \) \
+      2>/dev/null || true; } |
+    while IFS= read -r dir; do
+      if is_artifact "$dir" && is_stale "$dir"; then printf '%s\n' "$dir"; fi
+    done
+}
+
+clean_builds() {
+  case $1 in
+    check)
+      if ((${#PATHS[@]} == 0)); then SKIP_REASON="needs --path DIR"; return 1; fi
+      mapfile -t BUILDS < <(find_builds) ;;
+    estimate) bytes_of "${BUILDS[@]}" ;;
+    details) list_sizes "${BUILDS[@]}" ;;
+    run) safe_rm "${BUILDS[@]}" ;;
+  esac
+}
+
+clean_docker() {
+  case $1 in
+    check)
+      has docker || return 1
+      docker info >/dev/null 2>&1 || { SKIP_REASON="Docker daemon not reachable"; return 1; } ;;
+    run) run docker system prune --all --force --filter "until=$((DAYS * 24))h" ;;
+  esac
+}
+
+# --------------------------------------------------------------------------
+# Update tasks
+# --------------------------------------------------------------------------
+update_system() {
+  local pm
+  pm=$(pkg_manager) || { SKIP_REASON="no apt, dnf or pacman"; return 1; }
+  case $1 in
+    run)
+      case $pm in
+        apt-get) as_root apt-get update && as_root apt-get upgrade "${YES[@]}" ;;
+        dnf) as_root dnf upgrade "${YES[@]}" ;;
+        pacman) as_root pacman -Syu "${NOCONFIRM[@]}" ;;
+      esac ;;
+  esac
+}
+
+update_snap()    { case $1 in check) has snap ;; run) as_root snap refresh ;; esac; }
+update_flatpak() { case $1 in check) has flatpak ;; run) run flatpak update "${YES[@]}" ;; esac; }
+update_pipx()    { case $1 in check) has pipx ;; run) run pipx upgrade-all ;; esac; }
+update_uv()      { case $1 in check) has uv ;; run) run uv tool upgrade --all ;; esac; }
+update_rustup()  { case $1 in check) has rustup ;; run) run rustup update ;; esac; }
+update_tldr()    { case $1 in check) has tldr ;; run) run tldr --update ;; esac; }
+
+# omz is a zsh function, invisible to bash: call its upgrade script directly.
+update_omz() {
+  local dir=${ZSH:-$HOME/.oh-my-zsh}
+  case $1 in
+    check) [[ -f $dir/tools/upgrade.sh ]] && has zsh ;;
+    run) run env ZSH="$dir" zsh -f "$dir/tools/upgrade.sh" ;;
+  esac
+}
+
+# fwupdmgr exits with 2 when there is nothing to do; that is fine for us.
+fwupd() { local rc=0; fwupdmgr "$@" || rc=$?; ((rc == 0 || rc == 2)); }
+
+update_firmware() {
+  case $1 in
+    check) has fwupdmgr ;;
+    run) run fwupd refresh --force && run fwupd update "${YES[@]}" ;;
+  esac
+}
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+select_tasks() { # kind [task...]
+  local kind=$1 t
+  shift
+  local -n all="${kind^^}_TASKS"
+  for t in "$@" "${EXCLUDE[@]}"; do
+    in_list "$t" "${all[@]}" || die "unknown $kind task '$t' (see '$PROG --help')" 2
+  done
+  SELECTED=()
+  if (($#)); then
+    for t in "$@"; do in_list "$t" "${EXCLUDE[@]}" || SELECTED+=("$t"); done
+  else
+    for t in "${all[@]}"; do
+      if [[ -n ${OPTIN[$kind.$t]:-} ]] && ((!ALL)); then continue; fi
+      in_list "$t" "${EXCLUDE[@]}" || SELECTED+=("$t")
+    done
+  fi
+}
+
+top_dirs() {
+  { du -x -B1 -d1 -- "$HOME" 2>/dev/null || true; } | sort -rn | awk 'NR > 1 && NR <= 11'
+}
+
+cmd_scan() {
+  banner
+  section "Disk usage"
+  local mount
+  while read -r mount; do disk_bar "$mount"; done < <(LC_ALL=C df --output=target / "$HOME" 2>/dev/null | awk 'NR > 1 && !seen[$0]++')
+
+  section "Largest directories in your home"
+  local out size path
+  out=$(spin "measuring $HOME (can take a minute)…" top_dirs) || true
+  while IFS=$'\t' read -r size path; do
+    [[ -n $size ]] || continue
+    printf '  %10s  %s\n' "$(human "$size")" "$(tildify "$path")"
+  done <<<"$out"
+
+  section "Reclaimable space"
+  local t est tag total=0 unknown=0
+  for t in "${CLEAN_TASKS[@]}"; do
+    tag=''
+    if [[ -n ${ROOT[clean.$t]:-} ]]; then tag+=" sudo"; fi
+    if [[ -n ${OPTIN[clean.$t]:-} ]]; then tag+=" opt-in"; fi
+    SKIP_REASON="not installed"
+    if ! "clean_$t" check; then
+      printf '  %-12s %s%10s  %s%s\n' "$t" "$DIM" "-" "$SKIP_REASON" "$RESET"
+      continue
+    fi
+    est=$(spin "checking $t…" "clean_$t" estimate) || est=''
+    if [[ -z $est ]]; then
+      unknown=1
+      printf '  %-12s %10s  %s%s%s\n' "$t" "?" "$DIM" "unknown${tag:+ ·$tag}" "$RESET"
+    else
+      total=$((total + est))
+      printf '  %-12s %s%10s%s  %s%s%s\n' "$t" "$BOLD" "$(human "$est")" "$RESET" "$DIM" "${tag# }" "$RESET"
+    fi
+  done
+  printf '\n  %sTotal: %s%s%s\n' "$BOLD" "$( ((unknown)) && printf 'at least ')" "$(human "$total")" "$RESET"
+  printf '\n  Next: %s%s clean -n%s to preview, %s%s clean%s to clean' "$BOLD" "$PROG" "$RESET" "$BOLD" "$PROG" "$RESET"
+  printf ', %s%s clean -a -p ~/code%s to include build artifacts.\n' "$BOLD" "$PROG" "$RESET"
+}
+
+cmd_clean() {
+  banner
+  select_tasks clean "${ARGS[@]}"
+  ((${#SELECTED[@]})) || die "no tasks selected" 2
+  if ((DRY_RUN)); then info "dry run: nothing will be changed"; fi
+  prepare_root clean
+
+  local t f before after note free0 free1 would=0 failed=0
+  free0=$(free_bytes)
+  for t in "${SELECTED[@]}"; do
+    f=clean_$t
+    task_header clean "$t"
+    SKIP_REASON="not installed"
+    if ! "$f" check; then
+      info "skipped: $SKIP_REASON"
+      add_row "$t" skipped "$SKIP_REASON"
+      continue
+    fi
+    before=$(spin "estimating…" "$f" estimate) || before=''
+    if [[ $before == 0 ]]; then
+      info "nothing to clean"
+      add_row "$t" skipped "nothing to clean"
+      continue
+    fi
+    "$f" details || true
+    if [[ -n $before ]]; then info "reclaimable: $BOLD$(human "$before")$RESET"; else info "reclaimable: unknown"; fi
+    if ! confirm "Clean $t?"; then
+      add_row "$t" skipped "declined"
+      continue
+    fi
+
+    FAILED=0
+    "$f" run || true
+    if ((DRY_RUN)); then
+      add_row "$t" dry "${before:+would free $(human "$before")}"
+      would=$((would + ${before:-0}))
+      continue
+    fi
+    after=$("$f" estimate 2>/dev/null) || after=''
+    note=''
+    if [[ -n $before && -n $after ]]; then note="freed $(human $((before > after ? before - after : 0)))"; fi
+    if ((FAILED)); then
+      failed=1
+      add_row "$t" failed "$note"
+    else
+      add_row "$t" done "$note"
+    fi
+  done
+
+  print_summary
+  if ((DRY_RUN)); then
+    printf '\n  %sAbout %s could be freed.%s Run again without -n to do it.\n' "$BOLD" "$(human "$would")" "$RESET"
+  else
+    free1=$(free_bytes)
+    printf '\n  %sFreed %s%s  (free space: %s → %s)\n' "$BOLD$GREEN" \
+      "$(human $((free1 > free0 ? free1 - free0 : 0)))" "$RESET" "$(human "$free0")" "$(human "$free1")"
+  fi
+  return "$failed"
+}
+
+elapsed() {
+  local s=$((SECONDS - $1))
+  if ((s >= 60)); then printf '%dm%02ds' $((s / 60)) $((s % 60)); else printf '%ds' "$s"; fi
+}
+
+cmd_update() {
+  banner
+  select_tasks update "${ARGS[@]}"
+  local t start failed=0
+  local -a ready=()
+  for t in "${SELECTED[@]}"; do
+    SKIP_REASON="not installed"
+    if "update_$t" check; then ready+=("$t"); else add_row "$t" skipped "$SKIP_REASON"; fi
+  done
+  if ((${#ready[@]} == 0)); then
+    warn "nothing to update"
+    print_summary
+    return 0
+  fi
+
+  echo
+  info "ready to update: $BOLD${ready[*]}$RESET"
+  if ((DRY_RUN)); then info "dry run: nothing will be changed"; fi
+  if ! confirm "Update ${#ready[@]} component(s)?"; then
+    info "nothing done"
+    return 0
+  fi
+  SELECTED=("${ready[@]}")
+  prepare_root update
+
+  for t in "${ready[@]}"; do
+    task_header update "$t"
+    FAILED=0
+    start=$SECONDS
+    "update_$t" run || true
+    if ((DRY_RUN)); then
+      add_row "$t" dry
+    elif ((FAILED)); then
+      failed=1
+      add_row "$t" failed "after $(elapsed "$start")"
+    else
+      add_row "$t" done "in $(elapsed "$start")"
+    fi
+  done
+  print_summary
+  return "$failed"
+}
+
+# Prints "count<TAB>size<TAB>hash<TAB>path", files of the same group adjacent.
+find_dupes() { # min_bytes root...
+  local min=$1 size path h
+  shift
+  { find "$@" -xdev -type f -size +"$((min - 1))"c -printf '%s\t%D:%i\t%p\n' 2>/dev/null || true; } |
+    sort -t $'\t' -u -k2,2 |
+    awk -F '\t' '{ n[$1]++; line[NR] = $0; size[NR] = $1 }
+                 END { for (i = 1; i <= NR; i++) if (n[size[i]] > 1) print line[i] }' |
+    while IFS=$'\t' read -r size _ path; do
+      h=$(md5sum <"$path" 2>/dev/null) || continue
+      printf '%s\t%s\t%s\n' "$size" "${h%% *}" "$path"
+    done |
+    sort -t $'\t' -k1,1nr -k2,2 |
+    awk -F '\t' '{ k = $1 FS $2; c[k]++; line[NR] = $0; key[NR] = k }
+                 END { for (i = 1; i <= NR; i++) if (c[key[i]] > 1) print c[key[i]] "\t" line[i] }'
+}
+
+cmd_dupes() {
+  banner
+  local -a roots=("${ARGS[@]}" "${PATHS[@]}")
+  ((${#roots[@]})) || roots=("$HOME")
+  local i min
+  for i in "${!roots[@]}"; do
+    [[ -d ${roots[i]} ]] || die "not a directory: ${roots[i]}" 2
+    roots[i]=$(realpath -- "${roots[i]}")
+  done
+  min=$(to_bytes "$MIN_SIZE")
+  ((min > 0)) || min=1
+
+  section "Duplicate files of at least $MIN_SIZE"
+  local where=''
+  for i in "${roots[@]}"; do where+="${where:+, }$(tildify "$i")"; done
+  info "looking in: $where"
+  local out count size hash path prev='' groups=0 wasted=0
+  out=$(spin "comparing files…" find_dupes "$min" "${roots[@]}") || true
+  if [[ -z $out ]]; then
+    ok "no duplicates found"
+    return 0
+  fi
+  while IFS=$'\t' read -r count size hash path; do
+    if [[ $size:$hash != "$prev" ]]; then
+      prev=$size:$hash
+      groups=$((groups + 1))
+      wasted=$((wasted + size * (count - 1)))
+      printf '\n  %s%s × %d%s  %s%s wasted%s\n' "$BOLD" "$(human "$size")" "$count" "$RESET" \
+        "$YELLOW" "$(human $((size * (count - 1))))" "$RESET"
+    fi
+    printf '    %s\n' "$(tildify "$path")"
+  done <<<"$out"
+  printf '\n  %s%d group(s): %s could be freed by keeping one copy of each.%s\n' \
+    "$BOLD" "$groups" "$(human "$wasted")" "$RESET"
+  info "broom never deletes duplicates: review the list and remove what you don't need."
+}
+
+task_table() { # kind title
+  local kind=$1 t mark tag
+  local -n list="${kind^^}_TASKS"
+  printf '\n%s%s:%s\n' "$BOLD" "$2" "$RESET"
+  for t in "${list[@]}"; do
+    mark=' ' tag=''
+    if [[ -n ${OPTIN[$kind.$t]:-} ]]; then mark='*'; fi
+    if [[ -n ${ROOT[$kind.$t]:-} ]]; then tag=" ${DIM}(sudo)${RESET}"; fi
+    printf '  %-11s%s %s%s\n' "$t" "$mark" "${DESC[$kind.$t]}" "$tag"
+  done
+}
+
+usage() {
+  cat <<EOF
+
+${BOLD}Usage:${RESET} $PROG [command] [options] [task...]
+
+${BOLD}Commands:${RESET}
+  scan              Disk usage, biggest folders, what each task can reclaim ${DIM}(default, read-only)${RESET}
+  clean  [task...]  Free space; shows an estimate and asks before each task
+  update [task...]  Update system packages, snaps, flatpaks and developer tools
+  dupes  [path...]  List duplicate files ${DIM}(read-only, never deletes)${RESET}
+  help, version
+
+${BOLD}Options:${RESET}
+  -n, --dry-run            Show what would happen, change nothing
+  -y, --yes                Don't ask; also answers yes to package managers
+  -a, --all                Include opt-in tasks (marked with *)
+  -x, --exclude LIST       Skip tasks, comma separated (e.g. -x snap,journal)
+  -d, --older-than DAYS    Age threshold for thumbnails, builds and docker (default: $DAYS)
+  -p, --path DIR           Where to look for build artifacts or duplicates (repeatable)
+      --journal-size SIZE  Keep at most SIZE of systemd journal (default: $JOURNAL_SIZE)
+      --min-size SIZE      Smallest file compared by dupes (default: $MIN_SIZE)
+  -q, --quiet              No banner, no spinner
+      --no-color           Disable colors (NO_COLOR is honoured too)
+  -h, --help               Show this help
+  -V, --version            Show version
+EOF
+  task_table clean "Clean tasks"
+  task_table update "Update tasks"
+  cat <<EOF
+
+${BOLD}Examples:${RESET}
+  $PROG                           see what is eating your disk
+  $PROG clean -n                  preview a cleanup
+  $PROG clean -y                  clean everything safe, no questions
+  $PROG clean builds -p ~/code    delete stale build artifacts under ~/code
+  $PROG clean -x snap,journal     clean, but leave snaps and logs alone
+  $PROG update -y                 update everything, unattended
+  $PROG dupes ~/Downloads --min-size 10M
+EOF
+}
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+need_value() { [[ $# -ge 2 && -n $2 ]] || die "option '$1' needs a value" 2; }
+
+parse_args() {
+  local -a list
+  while (($#)); do
+    case $1 in
+      --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}"; continue ;;  # --opt=value
+      -[nyaqhV][!-]*) set -- "${1:0:2}" "-${1:2}" "${@:2}"; continue ;; # -ny -> -n -y
+      -[xdp]?*) set -- "${1:0:2}" "${1:2}" "${@:2}"; continue ;; # -xsnap -> -x snap
+      -h | --help) HELP=1 ;;
+      -V | --version) SHOW_VERSION=1 ;;
+      -n | --dry-run) DRY_RUN=1 ;;
+      -y | --yes) ASSUME_YES=1 ;;
+      -a | --all) ALL=1 ;;
+      -q | --quiet) QUIET=1 ;;
+      --no-color) NO_COLOR_FLAG=1 ;;
+      -x | --exclude) need_value "$@"; IFS=, read -ra list <<<"$2"; EXCLUDE+=("${list[@]}"); shift ;;
+      -d | --older-than) need_value "$@"; DAYS=$2; shift ;;
+      -p | --path) need_value "$@"; PATHS+=("$2"); shift ;;
+      --journal-size) need_value "$@"; JOURNAL_SIZE=$2; shift ;;
+      --min-size) need_value "$@"; MIN_SIZE=$2; shift ;;
+      --) shift; ARGS+=("$@"); break ;;
+      -*) die "unknown option '$1' (try '$PROG --help')" 2 ;;
+      *)
+        if [[ -n $CMD ]]; then
+          ARGS+=("$1")
+        else
+          case $1 in
+            scan | clean | update | dupes | help | version) CMD=$1 ;;
+            *) die "unknown command '$1' (try '$PROG --help')" 2 ;;
+          esac
+        fi ;;
+    esac
+    shift
+  done
+  CMD=${CMD:-scan}
+}
+
+validate() {
+  [[ $DAYS =~ ^[0-9]+$ ]] || die "--older-than expects a number of days, got '$DAYS'" 2
+  to_bytes "$JOURNAL_SIZE" >/dev/null || die "invalid --journal-size '$JOURNAL_SIZE' (e.g. 500M, 1G)" 2
+  to_bytes "$MIN_SIZE" >/dev/null || die "invalid --min-size '$MIN_SIZE' (e.g. 50M)" 2
+  local i
+  for i in "${!PATHS[@]}"; do
+    [[ -d ${PATHS[i]} ]] || die "--path '${PATHS[i]}' is not a directory" 2
+    PATHS[i]=$(realpath -- "${PATHS[i]}")
+  done
+  if ((ASSUME_YES)); then YES=(-y) NOCONFIRM=(--noconfirm); fi
+}
+
+main() {
+  parse_args "$@"
+  setup_colors
+  if ((HELP)) || [[ $CMD == help ]]; then banner; usage; return 0; fi
+  if ((SHOW_VERSION)) || [[ $CMD == version ]]; then echo "$PROG $VERSION"; return 0; fi
+  validate
+  if ((EUID == 0)) && [[ -n ${SUDO_USER:-} ]]; then
+    warn "running as root: user caches are looked up in $HOME. Run $PROG as your user, it asks for sudo when needed."
+  fi
+  trap 'printf "\n" >&2; err "interrupted"; exit 130' INT
+  "cmd_$CMD"
+}
+
+main "$@"
