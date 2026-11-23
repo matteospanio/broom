@@ -31,6 +31,8 @@ SKIP_REASON=""               # set by a task's "check" when it does not apply
 ROW_TASK=() ROW_STATE=() ROW_NOTE=()
 
 BOLD='' DIM='' RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' RESET=''
+C_HANDLE='' C_BIND='' C_BRISTLE='' C_DUST='' C_SPARK='' GRAD=('' '' '' '' '') # art palette
+FRAME=''                     # current spinner frame, set by sweep_frame
 
 # --------------------------------------------------------------------------
 # Task registry
@@ -74,6 +76,26 @@ setup_colors() {
   if ((NO_COLOR_FLAG)) || [[ -n ${NO_COLOR:-} || ! -t 1 ]]; then return 0; fi
   BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m'
   BLUE=$'\e[34m' MAGENTA=$'\e[35m' CYAN=$'\e[36m' RESET=$'\e[0m'
+  if [[ -n ${COLORTERM:-} || ${TERM:-} == *256color* ]]; then
+    C_HANDLE=$'\e[38;5;130m' C_BIND=$'\e[38;5;160m' C_BRISTLE=$'\e[38;5;220m'
+    C_DUST=$'\e[38;5;245m' C_SPARK=$'\e[38;5;159m'
+    GRAD=($'\e[1;38;5;219m' $'\e[1;38;5;213m' $'\e[1;38;5;177m' $'\e[1;38;5;141m' $'\e[1;38;5;105m')
+  else
+    C_HANDLE=$YELLOW C_BIND=$RED C_BRISTLE=$BOLD$YELLOW C_DUST=$DIM C_SPARK=$CYAN
+    GRAD=("$MAGENTA$BOLD" "$MAGENTA$BOLD" "$MAGENTA$BOLD" "$MAGENTA$BOLD" "$MAGENTA$BOLD")
+  fi
+}
+
+# Swap the colour tokens used in the drawings for escape codes:
+# H handle, K binding, B bristles, D dust, S sparkle.
+paint() {
+  local s=$1
+  s=${s//H/$C_HANDLE}
+  s=${s//K/$C_BIND}
+  s=${s//B/$C_BRISTLE}
+  s=${s//D/$C_DUST}
+  s=${s//S/$C_SPARK}
+  printf '%s%s' "$s" "$RESET"
 }
 
 info() { printf '  %s➜%s %s\n' "$CYAN" "$RESET" "$*"; }
@@ -85,6 +107,8 @@ die()  { err "$1"; exit "${2:-1}"; }
 banner() {
   ((QUIET)) && return 0
   local -a text=(
+    ''
+    ''
     '    __'
     '   / /_  _________  ____  ____ ___'
     '  / __ \/ ___/ __ \/ __ \/ __ `__ \'
@@ -92,13 +116,39 @@ banner() {
     '/_.___/_/   \____/\____/_/ /_/ /_/'
     ''
   )
-  local -a brush=('     |' '     |' '     |' '    /|\' '   //|\\' '  ///|\\\')
-  local i
+  local -a art=(
+    '   S✦     H║'
+    '         H║   S✧'
+    '         H║'
+    '        K▐█▌'
+    '       B╱╱│╲╲'
+    '      B╱╱╱│╲╲╲'
+    '     B╱╱╱╱│╲╲╲╲'
+    '   D˙ ·  ˙.· ˙  ·'
+  )
+  local i color
   echo
   for i in "${!text[@]}"; do
-    printf '%s%-36s%s%s%s\n' "$MAGENTA$BOLD" "${text[i]}" "$YELLOW" "${brush[i]}" "$RESET"
+    color=''
+    if ((i >= 2)); then color=${GRAD[i - 2]:-}; fi # gradient over the 5 letter rows
+    printf '%s%-36s%s%s\n' "$color" "${text[i]}" "$RESET" "$(paint "${art[i]}")"
   done
-  printf '%s  keep your Linux box lean · v%s%s\n' "$DIM" "$VERSION" "$RESET"
+  printf '  %skeep your Linux box lean%s %s·%s %sv%s%s\n' \
+    "$DIM" "$RESET" "$C_SPARK" "$RESET" "$DIM" "$VERSION" "$RESET"
+}
+
+# One frame of the spinner sprite: a broom sweeping back and forth along a
+# short track, kicking up dust in front of it. Every frame has the same width.
+SPRITE_TRACK=10
+sweep_frame() { # frame number
+  local n=$(($1 % (2 * SPRITE_TRACK))) pos sprite
+  local -a right=('·  ' '˙· ' '.˙·' ' .˙') left=('  ·' ' ·˙' '·˙.' '˙. ')
+  if ((n < SPRITE_TRACK)); then
+    pos=$n sprite="H═══K╡B▓▒░D${right[$1 % 4]}"
+  else
+    pos=$((2 * SPRITE_TRACK - 1 - n)) sprite="D${left[$1 % 4]}B░▒▓K╞H═══"
+  fi
+  printf -v FRAME '%*s%s%*s' "$pos" '' "$(paint "$sprite")" $((SPRITE_TRACK - pos)) ''
 }
 
 section() { printf '\n%s%s%s\n' "$BOLD$BLUE" "$1" "$RESET"; }
@@ -113,13 +163,13 @@ task_header() { # kind task
 spin() {
   local msg=$1; shift
   if ((QUIET)) || [[ ! -t 2 ]]; then "$@"; return; fi
-  local -a frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
   local i=0 rc=0 pid
   "$@" &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
-    printf '\r  %s%s%s %s' "$CYAN" "${frames[i++ % 10]}" "$RESET" "$msg" >&2
-    sleep 0.1
+    sweep_frame $((i++))
+    printf '\r  %s %s%s%s' "$FRAME" "$DIM" "$msg" "$RESET" >&2
+    sleep 0.08
   done
   wait "$pid" || rc=$?
   printf '\r\e[K' >&2
